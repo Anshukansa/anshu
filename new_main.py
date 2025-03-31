@@ -326,14 +326,19 @@ async def check_marketplace_pair(pair, user_data, seen_listings, first_run):
                     f"Link: https://www.facebook.com{link}"
                 )
 
-                sent_msg = await send_message(partial_text, chat_id)
-                if sent_msg is not None:
-                    partial_sent_map[chat_id] = (
-                        sent_msg.message_id,
-                        deal_message,
-                        fixed_lat,
-                        fixed_lon
-                    )
+                try:
+                    sent_msg = await send_message(partial_text, chat_id)
+                    if sent_msg is not None:
+                        partial_sent_map[chat_id] = (
+                            sent_msg.message_id,
+                            deal_message,
+                            fixed_lat,
+                            fixed_lon
+                        )
+                    else:
+                        logging.error(f"Failed to send initial message to {chat_id}")
+                except Exception as e:
+                    logging.error(f"Exception sending message to {chat_id}: {e}", exc_info=True)
 
             if not partial_sent_map:
                 continue
@@ -348,17 +353,50 @@ async def check_marketplace_pair(pair, user_data, seen_listings, first_run):
                 await asyncio.sleep(2)
 
                 detail_soup = BeautifulSoup(driver.page_source, 'html.parser')
-                div = detail_soup.find('div', style=re.compile('background-image'))
+                
+                # Debug - save HTML for inspection
+                logging.debug(f"Analyzing listing detail page for {link}")
+                
+                # Find div with background-image containing static_map.php
+                div = detail_soup.find('div', style=re.compile('background-image.*static_map'))
+                
                 if div:
                     style = div.get('style', '')
+                    logging.debug(f"Found map div with style: {style}")
                     url_match = re.search(r'url\("([^"]+)"\)', style)
+                    
                     if url_match:
                         img_url = url_match.group(1)
+                        logging.debug(f"Extracted map URL: {img_url}")
                         coords_match = re.search(r'center=([-0-9.]+)%2C([-0-9.]+)', img_url)
+                        
                         if coords_match:
                             latitude = float(coords_match.group(1))
                             longitude = float(coords_match.group(2))
+                            logging.info(f"Extracted coordinates: ({latitude}, {longitude})")
                             address = reverse_geocode(latitude, longitude)
+                        else:
+                            logging.warning(f"Could not extract coordinates from URL: {img_url}")
+                else:
+                    # Alternative method - look for div with specific classes that might contain the map
+                    map_div = detail_soup.find('div', class_='x13vifvy')
+                    if map_div and 'style' in map_div.attrs:
+                        style = map_div.get('style', '')
+                        url_match = re.search(r'background-image: url\("([^"]+)"\)', style)
+                        
+                        if url_match:
+                            img_url = url_match.group(1)
+                            coords_match = re.search(r'center=([-0-9.]+)%2C([-0-9.]+)', img_url)
+                            
+                            if coords_match:
+                                latitude = float(coords_match.group(1))
+                                longitude = float(coords_match.group(2))
+                                logging.info(f"Extracted coordinates (alt method): ({latitude}, {longitude})")
+                                address = reverse_geocode(latitude, longitude)
+                    else:
+                        # Save a sample of the HTML for debugging
+                        with open(f"listing_debug_{random.randint(1000, 9999)}.html", "w", encoding="utf-8") as f:
+                            f.write(detail_soup.prettify())
 
             except Exception as e:
                 logging.error(f"Error fetching detail for listing {link}: {e}")
@@ -367,13 +405,41 @@ async def check_marketplace_pair(pair, user_data, seen_listings, first_run):
                 driver.switch_to.window(driver.window_handles[0])
 
             for chat_id, (msg_id, user_deal_message, fixed_lat, fixed_lon) in partial_sent_map.items():
-                distance = calculate_distance(fixed_lat, fixed_lon, latitude, longitude)
-
-                updated_text = (
-                    f"{user_deal_message}{address} ({distance}) For {price}\n"
-                    f"Link: https://www.facebook.com{link}"
-                )
-                await edit_message(chat_id, msg_id, updated_text)
+                try:
+                    # Check if we have valid coordinates
+                    if latitude is None or longitude is None:
+                        logging.warning(f"Missing coordinates for listing {link}, can't calculate distance")
+                        updated_text = (
+                            f"{user_deal_message}{address} (Distance unknown) For {price}\n"
+                            f"Link: https://www.facebook.com{link}"
+                        )
+                    else:
+                        distance = calculate_distance(fixed_lat, fixed_lon, latitude, longitude)
+                        
+                        logging.info(f"Updating message for chat_id={chat_id}, msg_id={msg_id}")
+                        logging.info(f"  Address: {address}")
+                        logging.info(f"  Distance: {distance}")
+                        logging.info(f"  Coordinates: listing=({latitude}, {longitude}), user=({fixed_lat}, {fixed_lon})")
+                        
+                        updated_text = (
+                            f"{user_deal_message}{address} ({distance}) For {price}\n"
+                            f"Link: https://www.facebook.com{link}"
+                        )
+                    
+                    result = await edit_message(chat_id, msg_id, updated_text)
+                    if not result:
+                        logging.error(f"Failed to update message {msg_id} for chat_id {chat_id}")
+                except Exception as e:
+                    logging.error(f"Error updating message for chat_id={chat_id}: {e}", exc_info=True)
+                    # Try to still send a message even if distance calculation fails
+                    try:
+                        fallback_text = (
+                            f"{user_deal_message}Location update failed. For {price}\n"
+                            f"Link: https://www.facebook.com{link}"
+                        )
+                        await edit_message(chat_id, msg_id, fallback_text)
+                    except Exception:
+                        logging.error("Failed to send fallback message update", exc_info=True)
 
         first_run[pair] = False
 
